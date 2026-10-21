@@ -1,0 +1,466 @@
+<canvas id="webgl-canvas"></canvas>
+
+<style is:global>
+  body {
+    margin: 0;
+    overflow: hidden;
+    background-color: #000;
+    user-select: none;
+    -webkit-user-select: none;
+    font-family: monospace;
+  }
+
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    cursor: grab;
+  }
+
+  canvas:active {
+    cursor: grabbing;
+  }
+</style>
+
+<script>
+  import {
+    Color,
+    Matrix3,
+    Matrix4,
+    Mesh,
+    OrthographicCamera,
+    PlaneGeometry,
+    Quaternion,
+    Scene,
+    ShaderMaterial,
+    Timer,
+    Vector2,
+    Vector3,
+    WebGLRenderer,
+  } from 'three';
+  import GUI from 'lil-gui';
+
+  const vertexShader = `
+            varying vec2 vUv;
+            void main() {
+                vUv = uv;
+                gl_Position = vec4(position, 1.0);
+            }
+        `;
+
+  const fragmentShader = `
+            #ifdef GL_ES
+            precision highp float;
+            #endif
+
+            uniform vec2 uResolution;
+            uniform float uTime;
+            uniform int uMaxSteps;
+            uniform int uFoldSteps;
+            uniform float uKifsScale;
+            uniform float uKifsOffset;
+            uniform float uTextureScale;
+            uniform float uBrightness;
+            uniform float uSphereRadius;
+            uniform float uInnerRadius;
+            uniform vec3 uSphereCenter;
+            uniform vec3 uBaseColor;
+            uniform float uLightSpeed;
+            uniform float uAutoRotationSpeed;
+            uniform mat3 uInverseRotationMatrix;
+            uniform float uZoom;
+
+            varying vec2 vUv;
+
+            mat2 rotate2D(float angle) {
+                float s = sin(angle);
+                float c = cos(angle);
+                return mat2(c, -s, s, c);
+            }
+
+            vec2 intersectSphere(vec3 rayOrigin, vec3 rayDir, vec3 center, float radius) {
+                vec3 oc = rayOrigin - center;
+                float b = dot(oc, rayDir);
+                float c = dot(oc, oc) - radius * radius;
+                float h = b * b - c;
+
+                if(h < 0.0) return vec2(-1.0);
+                h = sqrt(h);
+                return vec2(-b - h, -b + h);
+            }
+
+            void main() {
+                vec2 uvCenter = (2.0 * gl_FragCoord.xy - uResolution.xy) / uResolution.y;
+
+                vec3 rayOriginWorld = vec3(0.0, 0.0, 0.0);
+                vec3 rayDirectionWorld = normalize(vec3(uvCenter * uZoom, -1.0));
+
+                vec3 localRayOrigin = rayOriginWorld - uSphereCenter;
+                localRayOrigin = uInverseRotationMatrix * localRayOrigin;
+                vec3 localRayDirection = uInverseRotationMatrix * rayDirectionWorld;
+
+                vec2 hitOuter = intersectSphere(localRayOrigin, localRayDirection, vec3(0.0), uSphereRadius);
+
+                if (hitOuter.x < 0.0) {
+                    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+                    return;
+                }
+
+                float tStart = max(0.0, hitOuter.x);
+                float tEnd = hitOuter.y;
+
+                float stepSize = (tEnd - tStart) / float(uMaxSteps);
+                float currentDistance = tStart;
+
+                vec4 accumulatedColor = vec4(0.0);
+
+                for (int i = 0; i < 250; i++) {
+                    if (i >= uMaxSteps) break;
+
+                    vec3 localPos = localRayOrigin + localRayDirection * currentDistance;
+                    float distFromCenter = length(localPos);
+
+                    float wallMask = smoothstep(uInnerRadius, uInnerRadius + 1.0, distFromCenter) * smoothstep(uSphereRadius, uSphereRadius - 0.2, distFromCenter);
+
+                    if (wallMask > 0.01) {
+
+                        vec3 currentPos = localPos * uTextureScale;
+
+                        currentPos.xy *= rotate2D(uTime * 0.15 * uAutoRotationSpeed);
+                        currentPos.xz *= rotate2D(uTime * 0.10 * uAutoRotationSpeed);
+
+                        currentPos = abs(currentPos);
+
+                        float timeVal = 2.6 + float(i) * 0.356;
+                        vec3 reflectionAxis = normalize(tan(timeVal + vec3(2.5, 1.0, 0.0)));
+                        currentPos = reflect(-currentPos, reflectionAxis) - vec3(-2.6, -1.0, 0.2);
+
+                        float accumulatedScale = 0.1;
+
+                        if (currentPos.x < currentPos.z) {
+                            currentPos = currentPos.zyx;
+                        }
+
+                        for (int k = 0; k < 16; k++) {
+                            if (k >= uFoldSteps) break;
+                            currentPos *= uKifsScale;
+                            accumulatedScale *= uKifsScale;
+                            currentPos.y += uKifsOffset;
+
+                            if (currentPos.y > currentPos.z) currentPos = currentPos.xzy;
+
+                            currentPos *= uKifsScale;
+                            accumulatedScale *= uKifsScale;
+                            currentPos.y += uKifsOffset;
+
+                            if (currentPos.x < currentPos.y) currentPos = currentPos.yxz;
+                        }
+
+                        float currentDensity = max(length(currentPos.xz) / accumulatedScale, 0.001);
+
+                        vec3 spatialPhase = currentPos.xyz;
+                        vec3 lightIntensity = exp(sin(uTime * uLightSpeed + spatialPhase)) / currentDensity;
+
+                        accumulatedColor.rgb += uBaseColor * lightIntensity * stepSize * uBrightness * wallMask;
+                    }
+
+                    currentDistance += stepSize;
+                }
+
+                gl_FragColor.rgb = tanh(accumulatedColor.rgb);
+                gl_FragColor.a = 1.0;
+
+                vec3 localHitPoint = localRayOrigin + localRayDirection * hitOuter.x;
+                vec3 surfaceNormalLocal = normalize(localHitPoint);
+                float edgeHighlight = 0.7 - max(dot(-localRayDirection, surfaceNormalLocal), 0.5);
+                gl_FragColor.rgb += vec3(0.05, 0.1, 0.3) * pow(edgeHighlight, 4.0);
+            }
+        `;
+
+  const canvas = document.getElementById('webgl-canvas') as HTMLCanvasElement;
+
+  const scene = new Scene();
+  const camera = new OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  const renderer = new WebGLRenderer({
+    canvas: canvas,
+    antialias: false,
+    powerPreference: 'high-performance',
+  });
+
+  const config = {
+    maxSteps: 148,
+    foldSteps: 6,
+    kifsScale: 1.26,
+    kifsOffset: 8.9,
+    textureScale: 1.45,
+    brightness: 1.423,
+    coreColor: '#7780ff',
+    colorBoost: 3.0,
+    lightSpeed: 5.5,
+    sphereRadius: 15.0,
+    innerRadius: 14.0,
+    sphereCenterZ: -25.0,
+    autoRotationSpeed: 1.0,
+    dpr: 1.0,
+  };
+
+  const uniforms = {
+    uResolution: { value: new Vector2(window.innerWidth, window.innerHeight) },
+    uTime: { value: 0.0 },
+    uMaxSteps: { value: config.maxSteps },
+    uFoldSteps: { value: config.foldSteps },
+    uKifsScale: { value: config.kifsScale },
+    uKifsOffset: { value: config.kifsOffset },
+    uTextureScale: { value: config.textureScale },
+    uBrightness: { value: config.brightness },
+    uSphereRadius: { value: config.sphereRadius },
+    uInnerRadius: { value: config.innerRadius },
+    uSphereCenter: { value: new Vector3(0.0, 0.0, config.sphereCenterZ) },
+    uBaseColor: { value: new Vector3() },
+    uLightSpeed: { value: config.lightSpeed },
+    uAutoRotationSpeed: { value: config.autoRotationSpeed },
+    uInverseRotationMatrix: { value: new Matrix3() },
+    uZoom: { value: 1.0 },
+  };
+
+  function updateBaseColorUniform() {
+    const tempColor = new Color(config.coreColor);
+    uniforms.uBaseColor.value.set(
+      tempColor.r * config.colorBoost,
+      tempColor.g * config.colorBoost,
+      tempColor.b * config.colorBoost
+    );
+  }
+  updateBaseColorUniform();
+
+  const geometry = new PlaneGeometry(2, 2);
+  const material = new ShaderMaterial({
+    vertexShader: vertexShader,
+    fragmentShader: fragmentShader,
+    uniforms: uniforms,
+    depthWrite: false,
+    depthTest: false,
+  });
+
+  const mesh = new Mesh(geometry, material);
+  scene.add(mesh);
+
+  let isDragging = false;
+  let previousPointerPosition = { x: 0, y: 0 };
+  let velocityX = 0,
+    velocityY = 0;
+  let currentZoom = 1.0;
+  let targetZoom = 1.0;
+
+  const targetRotation = new Quaternion();
+  const currentRotation = new Quaternion();
+  const axisX = new Vector3(1, 0, 0);
+  const axisY = new Vector3(0, 1, 0);
+
+  window.addEventListener('pointerdown', (e) => {
+    if ((e.target as HTMLElement).closest('.lil-gui')) return;
+    isDragging = true;
+    previousPointerPosition = { x: e.clientX, y: e.clientY };
+    velocityX = 0;
+    velocityY = 0;
+  });
+
+  window.addEventListener('pointermove', (e) => {
+    if (!isDragging) return;
+    const deltaX = e.clientX - previousPointerPosition.x;
+    const deltaY = e.clientY - previousPointerPosition.y;
+
+    velocityX = deltaX * 0.0035;
+    velocityY = deltaY * 0.0035;
+
+    const qY = new Quaternion().setFromAxisAngle(axisY, velocityX);
+    const qX = new Quaternion().setFromAxisAngle(axisX, velocityY);
+    targetRotation.premultiply(qX).premultiply(qY);
+    targetRotation.normalize();
+
+    previousPointerPosition = { x: e.clientX, y: e.clientY };
+  });
+
+  window.addEventListener('pointerup', () => {
+    isDragging = false;
+  });
+  window.addEventListener('pointercancel', () => {
+    isDragging = false;
+  });
+
+  window.addEventListener(
+    'wheel',
+    (e) => {
+      if ((e.target as HTMLElement).closest('.lil-gui')) return;
+      targetZoom += e.deltaY * 0.001;
+      targetZoom = Math.max(0.3, Math.min(4.0, targetZoom));
+    },
+    { passive: true }
+  );
+
+  let touchStartDist = 0;
+  let baseZoom = 1.0;
+
+  window.addEventListener(
+    'touchstart',
+    (e) => {
+      if (e.touches.length === 2) {
+        touchStartDist = Math.hypot(
+          e.touches[0].clientX - e.touches[1].clientX,
+          e.touches[0].clientY - e.touches[1].clientY
+        );
+
+        baseZoom = targetZoom;
+      }
+    },
+    { passive: true }
+  );
+
+  window.addEventListener(
+    'touchmove',
+    (e) => {
+      if (e.touches.length === 2 && touchStartDist > 0) {
+        const dist = Math.hypot(
+          e.touches[0].clientX - e.touches[1].clientX,
+          e.touches[0].clientY - e.touches[1].clientY
+        );
+
+        const factor = dist / touchStartDist;
+        targetZoom = Math.max(0.3, Math.min(4.0, baseZoom / factor));
+      }
+    },
+    { passive: true }
+  );
+
+  window.addEventListener('touchend', () => {
+    touchStartDist = 0;
+  });
+
+  const rotationMatrix4 = new Matrix4();
+  const rotationMatrix3 = new Matrix3();
+
+  function updateRotationAndZoom() {
+    if (!isDragging) {
+      velocityX *= 0.95;
+      velocityY *= 0.95;
+
+      const qY = new Quaternion().setFromAxisAngle(axisY, velocityX);
+      const qX = new Quaternion().setFromAxisAngle(axisX, velocityY);
+      targetRotation.premultiply(qX).premultiply(qY);
+      targetRotation.normalize();
+    }
+
+    currentRotation.slerp(targetRotation, 0.1);
+    currentZoom += (targetZoom - currentZoom) * 0.15;
+
+    rotationMatrix4.makeRotationFromQuaternion(currentRotation);
+    rotationMatrix4.invert();
+    rotationMatrix3.setFromMatrix4(rotationMatrix4);
+
+    uniforms.uInverseRotationMatrix.value.copy(rotationMatrix3);
+    uniforms.uZoom.value = currentZoom;
+  }
+
+  const gui = new GUI({ title: 'Control Panel' });
+  gui.close();
+
+  const fGeometry = gui.addFolder('Fractal Core');
+  fGeometry
+    .add(config, 'foldSteps', 1, 15, 1)
+    .name('Detail Steps')
+    .onChange((v: number) => (uniforms.uFoldSteps.value = v));
+  fGeometry
+    .add(config, 'kifsScale', 1.0, 1.8, 0.01)
+    .name('KIFS Scale')
+    .onChange((v: number) => (uniforms.uKifsScale.value = v));
+  fGeometry
+    .add(config, 'kifsOffset', 1.0, 15.0, 0.1)
+    .name('KIFS Offset')
+    .onChange((v: number) => (uniforms.uKifsOffset.value = v));
+  fGeometry
+    .add(config, 'textureScale', 0.1, 4.0, 0.05)
+    .name('Pattern Scale')
+    .onChange((v: number) => (uniforms.uTextureScale.value = v));
+
+  const fLight = gui.addFolder('Light & Glow');
+  fLight
+    .add(config, 'brightness', 0.1, 4.0, 0.01)
+    .name('Brightness')
+    .onChange((v: number) => (uniforms.uBrightness.value = v));
+  fLight.addColor(config, 'coreColor').name('Base Tint').onChange(updateBaseColorUniform);
+  fLight
+    .add(config, 'colorBoost', 0.5, 6.0, 0.1)
+    .name('Glow Intensity')
+    .onChange(updateBaseColorUniform);
+  fLight
+    .add(config, 'lightSpeed', 0.0, 15.0, 0.1)
+    .name('Pulse Speed')
+    .onChange((v: number) => (uniforms.uLightSpeed.value = v));
+
+  const fSphere = gui.addFolder('Outer Sphere');
+  fSphere
+    .add(config, 'sphereRadius', 5.0, 25.0, 0.1)
+    .name('Outer Radius')
+    .onChange((v: number) => {
+      uniforms.uSphereRadius.value = v;
+      if (config.innerRadius >= v) {
+        config.innerRadius = v - 1.0;
+        uniforms.uInnerRadius.value = config.innerRadius;
+        fSphere.controllers.find((c) => c.property === 'innerRadius')?.updateDisplay();
+      }
+    });
+  fSphere
+    .add(config, 'innerRadius', 4.0, 24.0, 0.1)
+    .name('Inner Radius')
+    .onChange((v: number) => {
+      if (v >= config.sphereRadius) {
+        config.innerRadius = config.sphereRadius - 1.0;
+        uniforms.uInnerRadius.value = config.innerRadius;
+        fSphere.controllers.find((c) => c.property === 'innerRadius')?.updateDisplay();
+      } else {
+        uniforms.uInnerRadius.value = v;
+      }
+    });
+  fSphere
+    .add(config, 'maxSteps', 20, 250, 1)
+    .name('Raymarching Detail')
+    .onChange((v: number) => (uniforms.uMaxSteps.value = v));
+
+  const fSystem = gui.addFolder('System Config');
+  fSystem
+    .add(config, 'autoRotationSpeed', 0.0, 3.0, 0.05)
+    .name('Auto Spin')
+    .onChange((v: number) => (uniforms.uAutoRotationSpeed.value = v));
+  fSystem
+    .add(config, 'dpr', 0.25, 2.0, 0.25)
+    .name('Screen DPR')
+    .onChange((v: number) => {
+      renderer.setPixelRatio(v);
+    });
+
+  function onWindowResize() {
+    const width = window.innerWidth;
+    const height = window.innerHeight;
+    renderer.setSize(width, height);
+    uniforms.uResolution.value.set(width, height);
+  }
+  window.addEventListener('resize', onWindowResize);
+
+  onWindowResize();
+  renderer.setPixelRatio(config.dpr);
+
+  const timer = new Timer();
+
+  function animate() {
+    requestAnimationFrame(animate);
+
+    timer.update();
+    uniforms.uTime.value = timer.getElapsed();
+
+    updateRotationAndZoom();
+
+    renderer.render(scene, camera);
+  }
+
+  animate();
+</script>
